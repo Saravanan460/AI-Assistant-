@@ -1,0 +1,15 @@
+# requirements.txt
+
+# Core LLM and Vector DB
+llama-cpp-python
+chromadb
+tinydb
+
+# Speech Recognition and Synthesis
+SpeechRecognition
+faster-whisper
+simpleaudio
+TTS
+
+# Embeddings
+sentence-transformers

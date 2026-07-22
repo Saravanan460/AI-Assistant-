@@ -3,15 +3,21 @@ from faster_whisper import WhisperModel
 import io
 import os
 import simpleaudio as sa
-from TTS.api import TTS
 import re
 import time
 import queue 
+import wave
 
 import sounddevice as sd
 import numpy as np
 import soundfile as sf
 import nltk
+
+try:
+    from piper.voice import PiperVoice
+except ImportError:
+    print("[Error] piper-tts not installed. Please run: pip install piper-tts")
+    exit(1)
 
 # --- NLTK Download (unchanged) ---
 try:
@@ -22,9 +28,6 @@ except LookupError:
     nltk.download('punkt_tab')
 # -----------------------------------
 
-print("Initializing Coqui TTS engine...")
-tts = TTS("tts_models/en/ljspeech/vits", gpu=False)
-print("Coqui TTS engine initialized.")
 
 class VoiceHandler:
     def __init__(self):
@@ -43,6 +46,37 @@ class VoiceHandler:
         self.interruption_callback = None
         self.speech_end_callback = None
         
+        # --- PIPER TTS SETUP ---
+        print("Initializing Piper TTS engine...")
+        piper_dir = os.path.abspath(os.path.join("models", "piper"))
+        os.makedirs(piper_dir, exist_ok=True)
+        model_name = "en_US-amy-medium"
+        model_path = os.path.join(piper_dir, f"{model_name}.onnx")
+        
+        if not os.path.exists(model_path):
+            print(f"[TTS] Downloading Piper voice model ({model_name}). This only happens once...")
+            import urllib.request
+            # Dynamically build URL based on model name (e.g., en_US-amy-medium -> amy)
+            parts = model_name.split('-')
+            lang_code = parts[0]
+            speaker = parts[1]
+            quality = parts[2]
+            
+            # The root language folder is usually just 'en' for 'en_US', 'en_GB' etc.
+            base_lang = lang_code.split('_')[0]
+            
+            model_url = f"https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/{base_lang}/{lang_code}/{speaker}/{quality}/{model_name}.onnx"
+            try:
+                urllib.request.urlretrieve(model_url, model_path)
+                urllib.request.urlretrieve(model_url + ".json", model_path + ".json")
+            except Exception as e:
+                print(f"[TTS] Error downloading model from {model_url}: {e}")
+                if os.path.exists(model_path): os.remove(model_path)
+                raise
+            
+        self.tts = PiperVoice.load(model_path)
+        print("Piper TTS engine initialized.")
+        
         # --- INITIAL DEVICE CHECK ---
         try:
             device_info = sd.query_devices(kind='input')
@@ -58,7 +92,21 @@ class VoiceHandler:
     def set_speech_end_callback(self, callback):
         self.speech_end_callback = callback
 
-    def _clean_text_for_tts(self, text):
+    def _parse_speech_chunks(self, text):
+        """
+        Parses text and returns a list of (type, data) tuples:
+        [('text', "Oh, you actually did it?"), ('pause', 0.6), ('text', "I'm shocked.")]
+        """
+        chunks = []
+        
+        # Convert explicit actions and emojis into pauses for natural human pacing
+        text = re.sub(r'\(dramatic pause\)', ' <PAUSE:0.8> ', text, flags=re.IGNORECASE)
+        text = re.sub(r'\*slow clap\*', ' <PAUSE:0.6> ', text, flags=re.IGNORECASE)
+        text = re.sub(r'\*.*?\*', ' <PAUSE:0.3> ', text) # Other actions
+        text = re.sub(r'[😂🤣]', ' <PAUSE:0.4> ', text)
+        text = re.sub(r'[🤔🙄]', ' <PAUSE:0.3> ', text)
+        
+        # Clean remaining emojis so TTS doesn't choke on them
         emoji_pattern = re.compile(
             "["
             "\U0001F600-\U0001F64F"
@@ -71,25 +119,63 @@ class VoiceHandler:
             "]+",
             flags=re.UNICODE,
         )
-        cleaned_text = emoji_pattern.sub(r'', text)
-        cleaned_text = re.sub(r'[\*#]', '', cleaned_text)
-        return cleaned_text.strip()
+        text = emoji_pattern.sub(r'', text)
+        text = text.replace('#', '')
+        
+        # Split text by <PAUSE:X> markers
+        parts = re.split(r'(<PAUSE:[0-9.]+>)', text)
+        
+        current_text = ""
+        for p in parts:
+            p = p.strip()
+            if not p:
+                continue
+            if p.startswith('<PAUSE:') and p.endswith('>'):
+                # Push accumulated text first
+                if current_text.strip():
+                    chunks.append(('text', current_text.strip()))
+                    current_text = ""
+                # Push the pause
+                duration = float(p[7:-1])
+                chunks.append(('pause', duration))
+            else:
+                current_text += p + " "
+                
+        if current_text.strip():
+            chunks.append(('text', current_text.strip()))
+            
+        # Group sentences to preserve cross-sentence prosody
+        final_chunks = []
+        for ctype, data in chunks:
+            if ctype == 'pause':
+                final_chunks.append((ctype, data))
+            else:
+                sentences = nltk.sent_tokenize(data)
+                # Group every 2 sentences to give Piper context for better intonation
+                for i in range(0, len(sentences), 2):
+                    group = " ".join(sentences[i:i+2])
+                    final_chunks.append(('text', group))
+                    # Add a very small natural breath pause between generated chunks
+                    final_chunks.append(('pause', 0.2)) 
+                    
+        return final_chunks
 
     # --- TTS Producer Thread ---
-    def _tts_producer_thread(self, sentences, audio_queue, stop_event, temp_file_prefix):
+    def _tts_producer_thread(self, chunks, audio_queue, stop_event, temp_file_prefix):
         """Generates audio files in a separate thread."""
         try:
-            for i, sentence in enumerate(sentences):
+            for i, (ctype, data) in enumerate(chunks):
                 if stop_event.is_set():
                     return
                 
-                if not sentence.strip():
-                    continue
-                
-                output_wav_path = f"{temp_file_prefix}_{i}.wav"
-                tts.tts_to_file(text=sentence, file_path=output_wav_path)
-                
-                audio_queue.put(output_wav_path)
+                if ctype == 'pause':
+                    audio_queue.put(('pause', data))
+                elif ctype == 'text':
+                    output_wav_path = f"{temp_file_prefix}_{i}.wav"
+                    # Synthesize with Piper directly to WAV
+                    with wave.open(output_wav_path, "wb") as wav_file:
+                        self.tts.synthesize_wav(data, wav_file)
+                    audio_queue.put(('file', output_wav_path))
             
             audio_queue.put(None) # End signal
             
@@ -103,31 +189,34 @@ class VoiceHandler:
 
     def _speak_silently_thread(self, text):
         try:
-            cleaned_text = self._clean_text_for_tts(text)
-            if not cleaned_text: return
+            chunks = self._parse_speech_chunks(text)
+            if not chunks: return
 
-            sentences = nltk.sent_tokenize(cleaned_text)
             audio_queue = queue.Queue()
             stop_event = threading.Event()
             temp_file_prefix = "temp_speech_silent"
 
             producer_thread = threading.Thread(
                 target=self._tts_producer_thread,
-                args=(sentences, audio_queue, stop_event, temp_file_prefix),
+                args=(chunks, audio_queue, stop_event, temp_file_prefix),
                 daemon=True
             )
             producer_thread.start()
 
             while True:
                 try:
-                    output_wav_path = audio_queue.get(timeout=10)
-                    if output_wav_path is None: break
+                    next_item = audio_queue.get(timeout=10)
+                    if next_item is None: break
                     
-                    wave_obj = sa.WaveObject.from_wave_file(output_wav_path)
-                    play_obj = wave_obj.play()
-                    play_obj.wait_done()
-                    
-                    os.remove(output_wav_path)
+                    ctype, data = next_item
+                    if ctype == 'pause':
+                        time.sleep(data)
+                    elif ctype == 'file':
+                        wave_obj = sa.WaveObject.from_wave_file(data)
+                        play_obj = wave_obj.play()
+                        play_obj.wait_done()
+                        if os.path.exists(data):
+                            os.remove(data)
                 except queue.Empty:
                     break
             
@@ -146,8 +235,9 @@ class VoiceHandler:
         audio_buffer = []
         current_wav_file = None
         
-        # --- SAFE BARGE-IN FLAG ---
-        # If true, we listen for interruptions. If false, we just speak (like silent mode).
+        is_paused = False
+        pause_end_time = 0
+        
         barge_in_enabled = False
 
         audio_queue = queue.Queue()
@@ -155,23 +245,18 @@ class VoiceHandler:
         temp_file_prefix = "temp_speech_barge_in"
 
         try:
-            cleaned_text = self._clean_text_for_tts(text)
-            if not cleaned_text:
+            chunks = self._parse_speech_chunks(text)
+            if not chunks:
                 if self.speech_end_callback: self.speech_end_callback()
                 return
 
-            sentences = nltk.sent_tokenize(cleaned_text)
-
             producer_thread = threading.Thread(
                 target=self._tts_producer_thread,
-                args=(sentences, audio_queue, stop_producer_event, temp_file_prefix),
+                args=(chunks, audio_queue, stop_producer_event, temp_file_prefix),
                 daemon=True
             )
             producer_thread.start()
 
-            # --- DYNAMIC MIC CONNECTION ---
-            # Try to connect to the mic. If it fails (no mic/wrong device), 
-            # we just log it and continue speaking WITHOUT barge-in.
             try:
                 stream = sd.InputStream(
                     samplerate=self.sample_rate,
@@ -186,7 +271,7 @@ class VoiceHandler:
                 print(f"[TTS] Warning: Could not open microphone for interruption ({e}). Barge-in disabled.")
                 barge_in_enabled = False
 
-            while producer_thread.is_alive() or not audio_queue.empty() or (play_obj and play_obj.is_playing()):
+            while producer_thread.is_alive() or not audio_queue.empty() or (play_obj and play_obj.is_playing()) or is_paused:
                 
                 # 1. Check for barge-in (ONLY if mic works)
                 if barge_in_enabled and stream and stream.active:
@@ -208,17 +293,33 @@ class VoiceHandler:
                             try: stream.stop(); stream.close()
                             except: pass
 
-                # 2. Play Audio
-                if not (play_obj and play_obj.is_playing()):
+                # 2. Handle programmatic pausing (emotions/breath)
+                if is_paused:
+                    if time.time() >= pause_end_time:
+                        is_paused = False
+                    else:
+                        time.sleep(0.01)
+                        continue
+
+                # 3. Play Audio
+                if not (play_obj and play_obj.is_playing()) and not is_paused:
                     try:
-                        next_file = audio_queue.get(block=False)
-                        if current_wav_file: os.remove(current_wav_file)
-                        if next_file is None: break 
+                        next_item = audio_queue.get(block=False)
+                        if current_wav_file and os.path.exists(current_wav_file):
+                            os.remove(current_wav_file)
+                            current_wav_file = None
+                            
+                        if next_item is None: break 
                         
-                        current_wav_file = next_file
-                        wave_obj = sa.WaveObject.from_wave_file(current_wav_file)
-                        play_obj = wave_obj.play()
-                        print(f"[TTS] Playing chunk {current_wav_file}")
+                        ctype, data = next_item
+                        if ctype == 'pause':
+                            is_paused = True
+                            pause_end_time = time.time() + data
+                        elif ctype == 'file':
+                            current_wav_file = data
+                            wave_obj = sa.WaveObject.from_wave_file(current_wav_file)
+                            play_obj = wave_obj.play()
+                            print(f"[TTS] Playing chunk {current_wav_file}")
 
                     except queue.Empty:
                         pass
@@ -247,7 +348,8 @@ class VoiceHandler:
             while not audio_queue.empty():
                 try:
                     f = audio_queue.get(block=False)
-                    if f and isinstance(f, str) and os.path.exists(f): os.remove(f)
+                    if f and isinstance(f, tuple) and f[0] == 'file' and os.path.exists(f[1]): 
+                        os.remove(f[1])
                 except queue.Empty: break
 
             if interruption_started and audio_buffer:
@@ -282,8 +384,6 @@ class VoiceHandler:
     def _listen_thread(self, callback):
         stream = None
         try:
-            # --- SAFE STREAM START ---
-            # We try to open the stream. If it fails (no mic), we inform the user via chat.
             try:
                 stream = sd.InputStream(
                     samplerate=self.sample_rate,
@@ -294,14 +394,12 @@ class VoiceHandler:
                 stream.start()
             except Exception as e:
                 print(f"[Audio Error] Could not open microphone: {e}")
-                # Send this special message to the chat window
                 callback("[SYSTEM] No microphone detected. Please connect a device or type to chat.")
                 return
 
             print("Listening... (Waiting for speech)")
             
             while True:
-                # Watch out for disconnection mid-loop
                 try:
                     audio_chunk, _ = stream.read(self.block_size)
                 except Exception as e:
@@ -329,7 +427,7 @@ class VoiceHandler:
                     else: silence_blocks = 0
                 except Exception as e:
                     print(f"\n[Audio Error] Mic lost during recording: {e}")
-                    break # Try to transcribe what we have
+                    break
             
             print("Recognizing... (Recording complete)")
             stream.stop()
@@ -342,7 +440,6 @@ class VoiceHandler:
             callback(recognized_text)
 
         except Exception as e:
-            # Catch-all for other errors
             print(f"\n[ERROR] Listen Thread: {e}")
             if stream: 
                 try: stream.stop(); stream.close()

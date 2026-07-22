@@ -1,11 +1,14 @@
-import tkinter as tk
+import customtkinter as ctk
 import threading
 from llm_handler import LLMHandler
 from ui_handler import ChatApplication
 from voice_handler import VoiceHandler
 from chat_logic import ChatLogic # <-- Import ChatLogic
+
 def main():
-    root = tk.Tk()
+    ctk.set_appearance_mode("Dark")
+    ctk.set_default_color_theme("blue")
+    root = ctk.CTk()
     # Initialize all handlers
     voice_handler = VoiceHandler()
     chat_logic = ChatLogic()

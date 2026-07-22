@@ -1,0 +1,32 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ChromaDB
+chromadb/
+chroma_db/
+chroma/
+
+# Chat history
+chat_history/
+chat_history.json
+history.json
+history/
+
+# Models
+# Note: Git does not support ignoring files by size (e.g., > 100MB).
+# To handle this, we ignore the models directory and common large model file extensions.
+# If you want to track small models, you can forcefully add them: `git add -f models/small_model.bin`
+models/
+*.bin
+*.gguf
+*.pt
+*.pth
+*.onnx
+*.safetensors
+*.ckpt
+
+# Temporary/Audio files
+*.wav
+temp_speech_*.wav
